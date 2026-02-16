@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - FileTransfer</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        .auth-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+
+        .auth-card {
+            background: var(--bg-glass);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            padding: var(--space-2xl);
+            border-radius: var(--radius-xl);
+            width: 100%;
+            max-width: 400px;
+            box-shadow: var(--shadow-lg);
+        }
+
+        .auth-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: var(--space-lg);
+            text-align: center;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .form-group {
+            margin-bottom: var(--space-lg);
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: var(--space-sm);
+            font-weight: 500;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: var(--space-md);
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            color: var(--text-primary);
+            font-family: inherit;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+        }
+
+        .auth-footer {
+            margin-top: var(--space-lg);
+            text-align: center;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .auth-link {
+            color: var(--accent-primary);
+            text-decoration: none;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .btn-full {
+            width: 100%;
+            justify-content: center;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="auth-container">
+        <div class="auth-card" id="loginCard">
+            <h1 class="auth-title">Welcome Back</h1>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label class="form-label">Username</label>
+                    <input type="text" class="form-input" id="loginUser" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Password</label>
+                    <input type="password" class="form-input" id="loginPass" required>
+                </div>
+                <button type="submit" class="btn btn-primary btn-full">Login</button>
+            </form>
+            <div class="auth-footer">
+                New user? <span class="auth-link" onclick="toggleAuth()">Create an account</span>
+            </div>
+        </div>
+
+        <div class="auth-card" id="registerCard" style="display: none;">
+            <h1 class="auth-title">Create Account</h1>
+            <form id="registerForm">
+                <div class="form-group">
+                    <label class="form-label">Username</label>
+                    <input type="text" class="form-input" id="regUser" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Password</label>
+                    <input type="password" class="form-input" id="regPass" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Confirm Password</label>
+                    <input type="password" class="form-input" id="regPassConfirm" required>
+                </div>
+                <button type="submit" class="btn btn-primary btn-full">Register</button>
+            </form>
+            <div class="auth-footer">
+                Already have an account? <span class="auth-link" onclick="toggleAuth()">Login</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function toggleAuth() {
+            const login = document.getElementById('loginCard');
+            const reg = document.getElementById('registerCard');
+            if (login.style.display === 'none') {
+                login.style.display = 'block';
+                reg.style.display = 'none';
+            } else {
+                login.style.display = 'none';
+                reg.style.display = 'block';
+            }
+        }
+
+        document.getElementById('loginForm').onsubmit = async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('loginUser').value;
+            const password = document.getElementById('loginPass').value;
+
+            const res = await fetch('/api/login', {
+                method: 'POST',
+                body: JSON.stringify({ username, password })
+            });
+
+            if (res.ok) {
+                window.location.reload();
+            } else {
+                alert('Login failed');
+            }
+        };
+
+        document.getElementById('registerForm').onsubmit = async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('regUser').value;
+            const password = document.getElementById('regPass').value;
+            const confirm = document.getElementById('regPassConfirm').value;
+
+            if (password !== confirm) {
+                alert('Passwords do not match');
+                return;
+            }
+
+            const res = await fetch('/api/register', {
+                method: 'POST',
+                body: JSON.stringify({ username, password })
+            });
+
+            if (res.ok) {
+                alert('Registration successful! Please login.');
+                toggleAuth();
+            } else {
+                alert('Registration failed');
+            }
+        };
+    </script>
+</body>
+
+</html>
