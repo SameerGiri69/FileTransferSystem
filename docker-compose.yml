@@ -1,0 +1,35 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+      - "9000:9000"
+      - "9001:9001/udp"
+    environment:
+      - DATABASE_URL=host=db port=5432 user=sameer password=Sameer@123 dbname=filetransfer sslmode=disable
+    volumes:
+      - ./downloads_docker:/app/downloads
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=sameer
+      - POSTGRES_PASSWORD=Sameer@123
+      - POSTGRES_DB=filetransfer
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U sameer -d filetransfer" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+volumes:
+  postgres_data:

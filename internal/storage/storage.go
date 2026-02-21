@@ -1,119 +1,165 @@
 package storage
 
 import (
-	"encoding/json"
-	"io/ioutil"
-	"os"
-	"path/filepath"
+	"crypto/rand"
+	"database/sql"
+	"fmt"
 	"sync"
-	"time"
+
+	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
 
 	"filetransfer/internal/models"
 )
 
 type Store struct {
-	mu          sync.RWMutex
-	dataDir     string
-	usersPath   string
-	historyPath string
-	Users       map[string]*models.User            `json:"users"`
-	History     map[string]*models.TransferHistory `json:"history"`
+	db       *sql.DB
+	sessions map[string]string // token → email
+	mu       sync.RWMutex
 }
 
-func NewStore(dataDir string) *Store {
-	os.MkdirAll(dataDir, 0755)
-
-	store := &Store{
-		dataDir:     dataDir,
-		usersPath:   filepath.Join(dataDir, "users.json"),
-		historyPath: filepath.Join(dataDir, "history.json"),
-		Users:       make(map[string]*models.User),
-		History:     make(map[string]*models.TransferHistory),
+func NewStore(connStr string) (*Store, error) {
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("ping db: %w", err)
 	}
 
-	store.load()
-	return store
+	s := &Store{db: db, sessions: make(map[string]string)}
+	if err := s.migrate(); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return s, nil
 }
 
-func (s *Store) load() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Store) migrate() error {
+	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS users (
+			id            SERIAL PRIMARY KEY,
+			email         TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
 
-	if data, err := ioutil.ReadFile(s.usersPath); err == nil {
-		var users map[string]*models.User
-		if err := json.Unmarshal(data, &users); err == nil {
-			s.Users = users
-		}
-	}
-
-	if data, err := ioutil.ReadFile(s.historyPath); err == nil {
-		var history map[string]*models.TransferHistory
-		if err := json.Unmarshal(data, &history); err == nil {
-			s.History = history
-		}
-	}
+		CREATE TABLE IF NOT EXISTS transfer_history (
+			id         TEXT NOT NULL,
+			user_email TEXT NOT NULL,
+			file_name  TEXT NOT NULL,
+			file_size  BIGINT NOT NULL,
+			direction  TEXT NOT NULL,
+			peer_name  TEXT NOT NULL,
+			status     TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (id, user_email)
+		);
+	`)
+	return err
 }
 
-func (s *Store) saveUsers() error {
-	data, err := json.MarshalIndent(s.Users, "", "  ")
+// RegisterUser creates a new unverified user.
+func (s *Store) RegisterUser(email, password string) error {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(s.usersPath, data, 0644)
+	_, err = s.db.Exec(
+		`INSERT INTO users (email, password_hash) VALUES ($1, $2)`,
+		email, string(hash),
+	)
+	return err
 }
 
-func (s *Store) saveHistory() error {
-	data, err := json.MarshalIndent(s.History, "", "  ")
+// AuthenticateUser validates email+password and returns the user.
+func (s *Store) AuthenticateUser(email, password string) (*models.User, error) {
+	u := &models.User{}
+	err := s.db.QueryRow(
+		`SELECT id, email, password_hash, created_at FROM users WHERE email=$1`, email,
+	).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("invalid credentials")
 	}
-	return ioutil.WriteFile(s.historyPath, data, 0644)
+	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
+		return nil, fmt.Errorf("invalid credentials")
+	}
+	return u, nil
 }
 
-func (s *Store) RegisterUser(username, password string) error {
+// GetUserByEmail returns a user record (without sensitive fields).
+func (s *Store) GetUserByEmail(email string) (*models.User, error) {
+	u := &models.User{}
+	err := s.db.QueryRow(
+		`SELECT id, email, created_at FROM users WHERE email=$1`, email,
+	).Scan(&u.ID, &u.Email, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// CreateSession stores a session token → email mapping and returns the token.
+func (s *Store) CreateSession(email string) string {
+	token := generateToken()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, exists := s.Users[username]; exists {
-		return os.ErrExist
-	}
-
-	s.Users[username] = &models.User{
-		Username:  username,
-		Password:  password,
-		CreatedAt: time.Now(),
-	}
-
-	return s.saveUsers()
+	s.sessions[token] = email
+	s.mu.Unlock()
+	return token
 }
 
-func (s *Store) LoginUser(username, password string) (*models.User, bool) {
+// GetSession returns the email for the given session token.
+func (s *Store) GetSession(token string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	user, exists := s.Users[username]
-	if !exists || user.Password != password {
-		return nil, false
-	}
-
-	return user, true
+	email, ok := s.sessions[token]
+	return email, ok
 }
 
-func (s *Store) AddHistory(item *models.TransferHistory) error {
+// DeleteSession removes a session token.
+func (s *Store) DeleteSession(token string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.History[item.ID] = item
-	return s.saveHistory()
+	delete(s.sessions, token)
+	s.mu.Unlock()
 }
 
-func (s *Store) GetHistory() []*models.TransferHistory {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// AddHistory persists a completed transfer record for a specific user.
+func (s *Store) AddHistory(userEmail string, item *models.TransferHistory) error {
+	_, err := s.db.Exec(
+		`INSERT INTO transfer_history (id, user_email, file_name, file_size, direction, peer_name, status)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 ON CONFLICT (id, user_email) DO NOTHING`,
+		item.ID, userEmail, item.FileName, item.FileSize, item.Direction, item.PeerName, item.Status,
+	)
+	return err
+}
 
-	history := make([]*models.TransferHistory, 0, len(s.History))
-	for _, item := range s.History {
+// GetHistory returns all transfer history for the user, newest first.
+func (s *Store) GetHistory(userEmail string) ([]*models.TransferHistory, error) {
+	rows, err := s.db.Query(
+		`SELECT id, file_name, file_size, direction, peer_name, status, created_at
+		 FROM transfer_history WHERE user_email=$1 ORDER BY created_at DESC`,
+		userEmail,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var history []*models.TransferHistory
+	for rows.Next() {
+		item := &models.TransferHistory{}
+		if err := rows.Scan(&item.ID, &item.FileName, &item.FileSize, &item.Direction,
+			&item.PeerName, &item.Status, &item.Timestamp); err != nil {
+			continue
+		}
 		history = append(history, item)
 	}
-	return history
+	return history, nil
+}
+
+// generateToken returns a 32-byte hex session token.
+func generateToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
 }

@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FileTransfer — Sign In</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg: #07070f;
+            --surface: rgba(255, 255, 255, 0.04);
+            --surface-hov: rgba(255, 255, 255, 0.07);
+            --border: rgba(255, 255, 255, 0.08);
+            --border-accent: rgba(139, 92, 246, 0.5);
+            --accent: #8b5cf6;
+            --accent2: #6366f1;
+            --text: #f1f5f9;
+            --muted: #64748b;
+            --muted2: #94a3b8;
+            --error: #f87171;
+            --success: #34d399;
+            --radius: 16px;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        /* Animated background blobs */
+        .blob {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(80px);
+            opacity: 0.18;
+            animation: drift 12s ease-in-out infinite alternate;
+            pointer-events: none;
+        }
+
+        .blob1 {
+            width: 500px;
+            height: 500px;
+            background: #7c3aed;
+            top: -10%;
+            left: -10%;
+            animation-delay: 0s;
+        }
+
+        .blob2 {
+            width: 400px;
+            height: 400px;
+            background: #4f46e5;
+            bottom: -5%;
+            right: -10%;
+            animation-delay: -4s;
+        }
+
+        .blob3 {
+            width: 300px;
+            height: 300px;
+            background: #0ea5e9;
+            bottom: 30%;
+            left: 30%;
+            animation-delay: -8s;
+        }
+
+        @keyframes drift {
+            from {
+                transform: translate(0, 0) scale(1);
+            }
+
+            to {
+                transform: translate(30px, 20px) scale(1.1);
+            }
+        }
+
+        .card {
+            position: relative;
+            width: 100%;
+            max-width: 420px;
+            background: rgba(13, 13, 22, 0.85);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 40px;
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            box-shadow: 0 32px 80px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(139, 92, 246, 0.1);
+            margin: 20px;
+        }
+
+        @media (max-width: 480px) {
+            .card {
+                padding: 24px;
+                margin: 16px;
+            }
+
+            .logo {
+                margin-bottom: 24px;
+            }
+
+            h2 {
+                font-size: 18px;
+            }
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 32px;
+        }
+
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        .logo-text {
+            font-size: 20px;
+            font-weight: 700;
+        }
+
+        .logo-text span {
+            color: var(--accent);
+        }
+
+        /* Tab switcher */
+        .tab-row {
+            display: flex;
+            background: rgba(255, 255, 255, 0.04);
+            border-radius: 12px;
+            padding: 4px;
+            margin-bottom: 28px;
+            gap: 4px;
+        }
+
+        .tab-btn {
+            flex: 1;
+            padding: 8px 0;
+            border: none;
+            background: transparent;
+            color: var(--muted);
+            font-family: inherit;
+            font-size: 14px;
+            font-weight: 500;
+            border-radius: 9px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .tab-btn.active {
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            color: #fff;
+            box-shadow: 0 4px 16px rgba(139, 92, 246, 0.3);
+        }
+
+        /* Steps */
+        .step {
+            display: none;
+            flex-direction: column;
+            gap: 18px;
+        }
+
+        .step.active {
+            display: flex;
+        }
+
+        .step-label {
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            color: var(--accent);
+            margin-bottom: -4px;
+        }
+
+        h2 {
+            font-size: 22px;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .subtitle {
+            font-size: 14px;
+            color: var(--muted2);
+        }
+
+        .field {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        label {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--muted2);
+        }
+
+        input {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px 14px;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 14px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            outline: none;
+        }
+
+        input:focus {
+            border-color: var(--border-accent);
+            box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.15);
+        }
+
+        input::placeholder {
+            color: var(--muted);
+        }
+
+        /* OTP input row */
+        .otp-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .otp-row input {
+            flex: 1;
+            text-align: center;
+            font-size: 22px;
+            font-weight: 700;
+            letter-spacing: 4px;
+            padding: 14px 8px;
+        }
+
+        .btn {
+            padding: 13px;
+            border: none;
+            border-radius: 12px;
+            font-family: inherit;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            color: #fff;
+            box-shadow: 0 4px 20px rgba(139, 92, 246, 0.35);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 8px 28px rgba(139, 92, 246, 0.45);
+        }
+
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-ghost {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--muted2);
+            border: 1px solid var(--border);
+        }
+
+        .btn-ghost:hover {
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text);
+        }
+
+        .link {
+            background: none;
+            border: none;
+            color: var(--accent);
+            font-family: inherit;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            padding: 0;
+            text-decoration: underline;
+            text-underline-offset: 2px;
+        }
+
+        .alert {
+            padding: 12px 14px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 500;
+            display: none;
+        }
+
+        .alert.error {
+            background: rgba(248, 113, 113, 0.1);
+            border: 1px solid rgba(248, 113, 113, 0.25);
+            color: var(--error);
+        }
+
+        .alert.success {
+            background: rgba(52, 211, 153, 0.1);
+            border: 1px solid rgba(52, 211, 153, 0.25);
+            color: var(--success);
+        }
+
+        .alert.show {
+            display: block;
+        }
+
+        .spinner {
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 8px;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .divider {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .divider::before,
+        .divider::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+
+        .resend-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 13px;
+            color: var(--muted2);
+        }
+
+        #resend-timer {
+            color: var(--muted);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="blob blob1"></div>
+    <div class="blob blob2"></div>
+    <div class="blob blob3"></div>
+
+    <div class="card">
+        <div class="logo">
+            <div class="logo-icon">📡</div>
+            <div class="logo-text">File<span>Transfer</span></div>
+        </div>
+
+        <!-- Tab row: Login | Register -->
+        <div class="tab-row" id="tab-row">
+            <button class="tab-btn active" id="tab-login" onclick="switchTab('login')">Sign In</button>
+            <button class="tab-btn" id="tab-register" onclick="switchTab('register')">Register</button>
+        </div>
+
+        <!-- Alert -->
+        <div class="alert" id="alert"></div>
+
+        <!-- LOGIN step -->
+        <div class="step active" id="step-login">
+            <div>
+                <div class="step-label">Welcome back</div>
+                <h2>Sign in to your account</h2>
+            </div>
+            <div class="field">
+                <label for="login-email">Email</label>
+                <input id="login-email" type="email" placeholder="you@example.com" autocomplete="email">
+            </div>
+            <div class="field">
+                <label for="login-pass">Password</label>
+                <input id="login-pass" type="password" placeholder="••••••••" autocomplete="current-password">
+            </div>
+            <button class="btn btn-primary" id="login-btn" onclick="doLogin()">Sign In</button>
+        </div>
+
+        <!-- REGISTER step 1: email + password -->
+        <div class="step" id="step-register">
+            <div>
+                <h2>Create an account</h2>
+            </div>
+            <div class="field">
+                <label for="reg-email">Email</label>
+                <input id="reg-email" type="email" placeholder="you@example.com">
+            </div>
+            <div class="field">
+                <label for="reg-pass">Password</label>
+                <input id="reg-pass" type="password" placeholder="Min. 8 characters">
+            </div>
+            <div class="field">
+                <label for="reg-pass2">Confirm Password</label>
+                <input id="reg-pass2" type="password" placeholder="••••••••">
+            </div>
+            <button class="btn btn-primary" id="reg-btn" onclick="doRegister()">Continue</button>
+        </div>
+    </div>
+
+    <script>
+        function showAlert(msg, type) {
+            const el = document.getElementById('alert');
+            el.textContent = msg;
+            el.className = `alert ${type} show`;
+            setTimeout(() => el.classList.remove('show'), 5000);
+        }
+
+        function setLoading(btnId, loading) {
+            const btn = document.getElementById(btnId);
+            btn.disabled = loading;
+            if (loading) btn.innerHTML = '<span class="spinner"></span>Please wait...';
+            else btn.textContent = btn.getAttribute('data-label-orig') || btn.textContent;
+        }
+
+        function switchTab(tab) {
+            document.getElementById('tab-login').classList.toggle('active', tab === 'login');
+            document.getElementById('tab-register').classList.toggle('active', tab === 'register');
+            document.getElementById('step-login').classList.toggle('active', tab === 'login');
+            document.getElementById('step-register').classList.toggle('active', tab === 'register');
+            document.getElementById('alert').classList.remove('show');
+        }
+
+        async function doLogin() {
+            const email = document.getElementById('login-email').value.trim();
+            const pass = document.getElementById('login-pass').value;
+            if (!email || !pass) { showAlert('Email and password required.', 'error'); return; }
+
+            document.getElementById('login-btn').dataset.labelOrig = 'Sign In';
+            setLoading('login-btn', true);
+            try {
+                const r = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password: pass })
+                });
+                const data = await r.json();
+                if (!r.ok) { showAlert(data.error || 'Login failed', 'error'); return; }
+                window.location.reload();
+            } finally {
+                document.getElementById('login-btn').disabled = false;
+                document.getElementById('login-btn').textContent = 'Sign In';
+            }
+        }
+
+        async function doRegister() {
+            const email = document.getElementById('reg-email').value.trim();
+            const pass = document.getElementById('reg-pass').value;
+            const pass2 = document.getElementById('reg-pass2').value;
+            if (!email || !pass) { showAlert('All fields required.', 'error'); return; }
+            if (pass !== pass2) { showAlert("Passwords don't match.", 'error'); return; }
+            if (pass.length < 6) { showAlert('Password must be at least 6 characters.', 'error'); return; }
+
+            document.getElementById('reg-btn').textContent = '';
+            setLoading('reg-btn', true);
+            try {
+                const r = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password: pass })
+                });
+                const data = await r.json();
+                if (!r.ok) { showAlert(data.error || 'Registration failed', 'error'); return; }
+                window.location.reload();
+            } finally {
+                document.getElementById('reg-btn').disabled = false;
+                document.getElementById('reg-btn').textContent = 'Continue';
+            }
+        }
+
+        // Enter key bindings
+        document.addEventListener('keydown', e => {
+            if (e.key !== 'Enter') return;
+            if (document.getElementById('step-login').classList.contains('active')) doLogin();
+            else if (document.getElementById('step-register').classList.contains('active')) doRegister();
+        });
+    </script>
+</body>
+
+</html>

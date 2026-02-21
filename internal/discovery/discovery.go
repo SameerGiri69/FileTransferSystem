@@ -12,6 +12,11 @@ import (
 	"filetransfer/internal/models"
 )
 
+const (
+	multicastAddr   = "239.0.0.1"
+	maxDatagramSize = 8192
+)
+
 type Service struct {
 	config      config.Config
 	localIP     string
@@ -37,48 +42,47 @@ func (s *Service) Start() {
 }
 
 func (s *Service) broadcastPresence() {
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("239.0.0.1:%d", s.config.DiscoveryPort))
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", multicastAddr, s.config.DiscoveryPort))
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("resolve broadcast addr:", err)
 	}
 
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		log.Println("Broadcast error:", err)
+		log.Println("Broadcast dial error:", err)
 		return
 	}
 	defer conn.Close()
 
 	for {
-		name := s.config.DeviceName
 		username := s.getUsername()
-
-		msg := map[string]interface{}{
-			"id":       s.deviceID,
-			"name":     name,
-			"username": username,
-			"ip":       s.localIP,
-			"port":     s.config.TransferPort,
-		}
-		data, _ := json.Marshal(msg)
-		if _, err := conn.Write(data); err != nil {
-			log.Printf("Broadcast write error: %v", err)
+		// Only broadcast when logged in
+		if username != "" {
+			msg := map[string]interface{}{
+				"id":       s.deviceID,
+				"name":     s.config.DeviceName,
+				"username": username,
+				"ip":       s.localIP,
+				"port":     s.config.TransferPort,
+			}
+			data, _ := json.Marshal(msg)
+			if _, err := conn.Write(data); err != nil {
+				log.Println("Broadcast write error:", err)
+			}
 		}
 		time.Sleep(s.config.BroadcastInt)
 	}
 }
 
-const maxDatagramSize = 8192
-
 func (s *Service) listenDiscovery() {
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("239.0.0.1:%d", s.config.DiscoveryPort))
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", multicastAddr, s.config.DiscoveryPort))
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("resolve discovery addr:", err)
 	}
 
 	conn, err := net.ListenMulticastUDP("udp", nil, addr)
 	if err != nil {
-		log.Printf("Discovery listen error: %v", err)
+		log.Println("Discovery listen error:", err)
 		return
 	}
 	defer conn.Close()
@@ -88,7 +92,7 @@ func (s *Service) listenDiscovery() {
 	for {
 		n, srcAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("Read error: %v", err)
+			log.Println("Discovery read error:", err)
 			continue
 		}
 
@@ -97,35 +101,41 @@ func (s *Service) listenDiscovery() {
 			continue
 		}
 
-		id, ok := msg["id"].(string)
-		if !ok || id == s.deviceID {
+		id, _ := msg["id"].(string)
+		if id == "" {
+			continue
+		}
+		if id == s.deviceID {
 			continue
 		}
 
-		// Update or add device
-		s.mu.Lock()
-		userName, _ := msg["username"].(string)
+		username, _ := msg["username"].(string)
+		name, _ := msg["name"].(string)
+		log.Printf("[DISCOVERY] Found peer: %s (%s) from %s", username, name, srcAddr.String())
+		portFloat, _ := msg["port"].(float64)
 
+		s.mu.Lock()
 		s.devices[id] = &models.Device{
 			ID:       id,
-			Name:     msg["name"].(string),
-			UserName: userName,
+			Name:     name,
+			Username: username,
 			IP:       srcAddr.IP.String(),
-			Port:     int(msg["port"].(float64)),
+			Port:     int(portFloat),
 			LastSeen: time.Now(),
 		}
 		s.mu.Unlock()
 	}
 }
 
+// GetDevices returns devices seen in the last 10 seconds.
 func (s *Service) GetDevices() []*models.Device {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	devices := make([]*models.Device, 0, len(s.devices))
-	for _, dev := range s.devices {
-		if time.Since(dev.LastSeen) < 10*time.Second {
-			devices = append(devices, dev)
+	var devices []*models.Device
+	for _, d := range s.devices {
+		if time.Since(d.LastSeen) < 10*time.Second {
+			devices = append(devices, d)
 		}
 	}
 	return devices
@@ -134,6 +144,6 @@ func (s *Service) GetDevices() []*models.Device {
 func (s *Service) GetDevice(id string) (*models.Device, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	dev, ok := s.devices[id]
-	return dev, ok
+	d, ok := s.devices[id]
+	return d, ok
 }

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FileTransfer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/app.css">
+</head>
+
+<body>
+
+    <!-- Backgrounds -->
+    <div class="blob blob1"></div>
+    <div class="blob blob2"></div>
+    <div class="blob blob3"></div>
+
+    <!-- Navbar -->
+    <nav class="navbar">
+        <div class="nav-logo">
+            <div class="nav-logo-icon">📡</div>
+            <span>File<strong>Transfer</strong></span>
+        </div>
+        <div class="nav-right">
+            <div class="device-pill" id="device-pill">
+                <span class="dot"></span>
+                <span id="me-email">Loading...</span>
+            </div>
+            <button class="btn-logout" onclick="App.logout()">Sign Out</button>
+        </div>
+    </nav>
+
+    <!-- Tab Bar -->
+    <div class="tab-bar">
+        <button class="tab-item active" id="tab-scan" onclick="App.switchTab('scan')">
+            <span class="tab-icon">🔍</span>
+            <span>Scan</span>
+        </button>
+        <button class="tab-item" id="tab-downloads" onclick="App.switchTab('downloads')">
+            <span class="tab-icon">📥</span>
+            <span>Downloads</span>
+            <span class="badge" id="downloads-badge" style="display:none"></span>
+        </button>
+        <button class="tab-item" id="tab-history" onclick="App.switchTab('history')">
+            <span class="tab-icon">🕒</span>
+            <span>History</span>
+        </button>
+    </div>
+
+    <!-- Tab: Scan -->
+    <div class="tab-content active" id="content-scan">
+        <div class="section-header">
+            <div>
+                <h2>Nearby Devices</h2>
+                <p class="section-sub">Devices on the same Wi-Fi network</p>
+            </div>
+            <button class="btn-icon" onclick="App.scanDevices()" title="Refresh">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M23 4v6h-6M1 20v-6h6" />
+                    <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
+                </svg>
+            </button>
+        </div>
+
+        <!-- Active transfers -->
+        <div id="active-section" style="display:none; margin-bottom:24px;">
+            <h3 class="sub-title">Active Transfers</h3>
+            <div id="active-list" class="active-list"></div>
+        </div>
+
+        <div id="device-grid" class="device-grid">
+            <div class="empty-state" id="scan-empty">
+                <div class="empty-icon">📡</div>
+                <div class="empty-title">Scanning for devices...</div>
+                <div class="empty-sub">Make sure other devices are on the same Wi-Fi and signed in</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: Downloads -->
+    <div class="tab-content" id="content-downloads">
+        <div class="section-header">
+            <div>
+                <h2>Downloaded Files</h2>
+                <p class="section-sub">Files received from other devices</p>
+            </div>
+        </div>
+        <div id="files-list" class="files-list">
+            <div class="empty-state">
+                <div class="empty-icon">📂</div>
+                <div class="empty-title">No files yet</div>
+                <div class="empty-sub">Files you receive will appear here</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tab: History -->
+    <div class="tab-content" id="content-history">
+        <div class="section-header">
+            <div>
+                <h2>Transfer History</h2>
+                <p class="section-sub">All completed transfers</p>
+            </div>
+        </div>
+        <div id="history-table-wrap" class="table-wrap">
+            <div class="empty-state">
+                <div class="empty-icon">🕒</div>
+                <div class="empty-title">No history yet</div>
+                <div class="empty-sub">Completed transfers will appear here</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ====== Send Drawer ====== -->
+    <div class="drawer-backdrop" id="drawer-backdrop" onclick="App.closeDrawer()"></div>
+    <div class="drawer" id="send-drawer">
+        <div class="drawer-header">
+            <div class="drawer-title">
+                <div class="peer-avatar" id="drawer-avatar">?</div>
+                <div>
+                    <div class="drawer-peer-name" id="drawer-peer-name">Device</div>
+                    <div class="drawer-peer-ip" id="drawer-peer-ip">Connecting...</div>
+                </div>
+            </div>
+            <button class="btn-close" onclick="App.closeDrawer()">✕</button>
+        </div>
+        <div class="drawer-body">
+            <label class="file-drop-zone" id="file-drop-zone" for="file-input">
+                <div class="drop-icon">📤</div>
+                <div class="drop-text">Click or drag a file here</div>
+                <div class="drop-sub" id="file-name-display">No file selected</div>
+            </label>
+            <input type="file" id="file-input" style="display:none" onchange="App.onFileSelect(event)">
+            <button class="btn btn-primary btn-full" id="send-btn" onclick="App.doSend()" disabled>
+                Send File
+            </button>
+        </div>
+    </div>
+
+    <!-- ====== Incoming Request Toast ====== -->
+    <div id="incoming-toast-container"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>

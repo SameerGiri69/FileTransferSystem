@@ -1,12 +1,10 @@
 package main
 
 import (
-	"embed"
 	"flag"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"time"
 
 	"filetransfer/internal/api"
@@ -15,100 +13,100 @@ import (
 	"filetransfer/internal/storage"
 	"filetransfer/internal/transfer"
 	"filetransfer/pkg/utils"
+	"filetransfer/web"
 )
 
-//go:embed web/templates/* web/static/*
-var content embed.FS
-
 func main() {
-	// Command-line flags
 	webPort := flag.Int("web", 8080, "Web UI port")
-	transferPort := flag.Int("transfer", 9000, "File transfer port")
+	transferPort := flag.Int("transfer", 9000, "File transfer TCP port")
 	deviceName := flag.String("name", "", "Device name (defaults to hostname)")
-	downloadDir := flag.String("downloads", "./downloads", "Download directory")
 	flag.Parse()
 
-	// Hostname default
+	// Device name
 	hostname, _ := os.Hostname()
-	finalDeviceName := hostname
+	finalName := hostname
 	if *deviceName != "" {
-		finalDeviceName = *deviceName
+		finalName = *deviceName
 	}
 
-	// Configuration
+	// Downloads dir → user's ~/Downloads
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "."
+	}
+	downloadDir := homeDir + "/Downloads"
+	os.MkdirAll(downloadDir, 0755)
+
+	// SMTP config — env overrides, fallback to defaults
+	smtpFrom := getEnv("SMTP_FROM", "filetransfer@example.com")
+	smtpPass := getEnv("SMTP_PASS", "dyhz zlfe ejma xnna") // Gmail App Password
+
+	// PostgreSQL DSN — env override or default
+	dbDSN := getEnv("DATABASE_URL",
+		"host=127.0.0.1 port=5432 user=sameer password=Sameer@123 dbname=filetransfer sslmode=disable")
+
 	cfg := config.Config{
 		ServerPort:    *webPort,
 		TransferPort:  *transferPort,
-		DiscoveryPort: 9001, // Fixed for all devices
+		DiscoveryPort: 9001,
 		ChunkSize:     65536,
-		DownloadDir:   *downloadDir,
-		DeviceName:    finalDeviceName,
+		DownloadDir:   downloadDir,
+		DeviceName:    finalName,
 		BroadcastInt:  3 * time.Second,
+		DBConnStr:     dbDSN,
+		SMTPFrom:      smtpFrom,
+		SMTPPass:      smtpPass,
 	}
 
-	// Setup directories
-	os.MkdirAll(cfg.DownloadDir, 0755)
+	// Storage (Postgres)
+	store, err := storage.NewStore(dbDSN)
+	if err != nil {
+		log.Fatalf("Cannot connect to database: %v\n  DSN: %s\n  Tip: set DATABASE_URL env var to override.", err, dbDSN)
+	}
+	log.Println("Connected to PostgreSQL database ✓")
 
-	// Utilities
-	localIP := utils.GetLocalIP() // Or use GetOutboundIP() for better accuracy?
+	// Network
+	localIP := utils.GetLocalIP()
 	if localIP == "" {
 		localIP = "127.0.0.1"
 	}
 	deviceID := fmt.Sprintf("%s-%d", localIP, time.Now().UnixNano())
 
-	log.Printf("Starting FileTransfer on %s (%s)", localIP, cfg.DeviceName)
+	// Wire up services
+	// API server created first so we can pass GetUsername to discovery
+	apiServer := api.NewServer(cfg, store, nil, nil, localIP, web.FS)
 
-	// Services
-	store := storage.NewStore(filepath.Join(".", fmt.Sprintf("data_%d", cfg.ServerPort))) // Separate data dir for instances if running multiple?
-	// Note: previous implementation used "data" for all.
-	// But if running multiple instances locally, they share "data/users.json". This is GOOD (shared users).
-	// But "history"? Shared history might be confusing if they are "different devices".
-	// But user requirement was "run simple test on one device".
-	// If I use "data", they share everything.
-	// Previously in `store.go`, I hardcoded `filepath.Join(dataDir, ...)` and passed `filepath.Join(".", "data")` in main.
-	// For testing, I should probably separate them if I want them to act as distinct devices with distinct history?
-	// But "Users" should be shared?
-	// Let's stick to "data" folder for now, but maybe use "data_<PORT>" to avoid locking issues on JSON files if we run them concurrently?
-	// `store.go` uses `ioutil.WriteFile` (atomic write usually). `users.json` read/write might race.
-	// To be safe for the "Multiple Instances Test", I'll use separate data dirs based on port.
-	// Or just "data" and hope for the best (usually fine for read-mostly users, write-heavy history might interleave).
-	// I'll use unique data dir to prevent conflicts in this testing scenario.
-	dataDir := fmt.Sprintf("data_%d", cfg.ServerPort)
-	store = storage.NewStore(dataDir)
+	discSvc := discovery.NewService(cfg, localIP, deviceID, apiServer.GetUsername)
 
-	// API Server (needs to be created first to get Broadcast ref, or circular dep?)
-	// Server needs TransferService. TransferService needs Broadcast.
-	// I'll create Server first, then TransferService, then set TransferService on Server.
+	transferSvc := transfer.NewService(cfg, deviceID, store, discSvc, apiServer.Broadcast, apiServer.GetUsername)
 
-	apiServer := api.NewServer(cfg, store, nil, localIP, content)
+	apiServer.SetDiscovery(discSvc)
+	apiServer.SetTransfer(transferSvc)
 
-	// Discovery Service
-	// Needs to get current username from Server logic
-	discoveryService := discovery.NewService(cfg, localIP, deviceID, apiServer.GetUsername)
+	// Start background services
+	discSvc.Start()
+	transferSvc.Start()
 
-	// Transfer Service
-	// Broadcasts via API Server's WebSocket
-	transferService := transfer.NewService(cfg, deviceID, store, discoveryService, apiServer.Broadcast)
-
-	// Wire up circular dependencies
-	apiServer.SetTransferService(transferService)
-	apiServer.SetDiscoveryService(discoveryService)
-
-	// Start Services
-	discoveryService.Start()
-	transferService.Start()
-
-	fmt.Printf("\n")
-	fmt.Printf("╔══════════════════════════════════════════════════╗\n")
-	fmt.Printf("║           FileTransfer - Ready!                  ║\n")
-	fmt.Printf("╠══════════════════════════════════════════════════╣\n")
-	fmt.Printf("║  Device: %-40s║\n", cfg.DeviceName)
-	fmt.Printf("║  Local IP: %-38s║\n", localIP)
-	fmt.Printf("║  Web UI: http://localhost:%-23d║\n", cfg.ServerPort)
-	fmt.Printf("║  Transfer Port: %-33d║\n", cfg.TransferPort)
-	fmt.Printf("║  Data Dir: %-38s║\n", dataDir)
-	fmt.Printf("╚══════════════════════════════════════════════════╝\n")
-	fmt.Printf("\n")
+	printBanner(cfg, localIP, downloadDir)
 
 	log.Fatal(apiServer.Start())
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func printBanner(cfg config.Config, localIP, downloadDir string) {
+	fmt.Printf("\n")
+	fmt.Printf("╔══════════════════════════════════════════════════════╗\n")
+	fmt.Printf("║              FileTransfer  — Ready!                  ║\n")
+	fmt.Printf("╠══════════════════════════════════════════════════════╣\n")
+	fmt.Printf("║  Device   : %-40s║\n", cfg.DeviceName)
+	fmt.Printf("║  Local IP : %-40s║\n", localIP)
+	fmt.Printf("║  Web UI   : http://localhost:%-25d║\n", cfg.ServerPort)
+	fmt.Printf("║  Downloads: %-40s║\n", downloadDir)
+	fmt.Printf("╚══════════════════════════════════════════════════════╝\n\n")
 }

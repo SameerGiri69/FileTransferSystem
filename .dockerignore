@@ -1,0 +1,12 @@
+.git
+.gitignore
+*.log
+data/
+downloads/
+node_modules/
+filetransfer
+docker-compose.yml
+Dockerfile
+.gemini/
+.agents/
+brain/

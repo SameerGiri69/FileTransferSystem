@@ -1,8 +1,7 @@
 package transfer
 
 import (
-	"crypto/md5"
-	"encoding/hex"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +11,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"filetransfer/internal/config"
 	"filetransfer/internal/discovery"
@@ -25,18 +26,31 @@ type Service struct {
 	store     *storage.Store
 	discovery *discovery.Service
 	broadcast func(string, interface{})
+
 	transfers map[string]*models.Transfer
+	pending   map[string]*models.PendingTransfer
 	mu        sync.RWMutex
+
+	getUsername func() string
 }
 
-func NewService(cfg config.Config, deviceID string, store *storage.Store, disc *discovery.Service, broadcast func(string, interface{})) *Service {
+func NewService(
+	cfg config.Config,
+	deviceID string,
+	store *storage.Store,
+	disc *discovery.Service,
+	broadcast func(string, interface{}),
+	getUsername func() string,
+) *Service {
 	return &Service{
-		config:    cfg,
-		deviceID:  deviceID,
-		store:     store,
-		discovery: disc,
-		broadcast: broadcast,
-		transfers: make(map[string]*models.Transfer),
+		config:      cfg,
+		deviceID:    deviceID,
+		store:       store,
+		discovery:   disc,
+		broadcast:   broadcast,
+		transfers:   make(map[string]*models.Transfer),
+		pending:     make(map[string]*models.PendingTransfer),
+		getUsername: getUsername,
 	}
 }
 
@@ -44,12 +58,15 @@ func (s *Service) Start() {
 	go s.listenTCP()
 }
 
+// ----- TCP Listener (Receiver Side) -----
+
 func (s *Service) listenTCP() {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.config.TransferPort))
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Transfer listen:", err)
 	}
 	defer ln.Close()
+	log.Printf("Transfer listener on :%d", s.config.TransferPort)
 
 	for {
 		conn, err := ln.Accept()
@@ -57,75 +74,127 @@ func (s *Service) listenTCP() {
 			log.Println("Accept error:", err)
 			continue
 		}
-		go s.handleIncomingTransfer(conn)
+		go s.handleIncoming(conn)
 	}
 }
 
-func (s *Service) handleIncomingTransfer(conn net.Conn) {
-	defer conn.Close()
+type wireMetadata struct {
+	ID         string `json:"id"`
+	FileName   string `json:"fileName"`
+	FileSize   int64  `json:"fileSize"`
+	SenderID   string `json:"senderId"`
+	SenderName string `json:"senderName"`
+}
 
-	// 1. Read metadata
-	var metadata struct {
-		ID       string `json:"id"`
-		FileName string `json:"fileName"`
-		FileSize int64  `json:"fileSize"`
-		PeerID   string `json:"peerId"` // Sender's ID
-		PeerName string `json:"peerName"`
-	}
+type wireResponse struct {
+	Accept bool `json:"accept"`
+}
 
-	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&metadata); err != nil {
+func (s *Service) handleIncoming(conn net.Conn) {
+	defer func() {
+		// conn closed after accept/reject decision was acted on
+	}()
+
+	reader := bufio.NewReader(conn)
+	var meta wireMetadata
+	if err := json.NewDecoder(reader).Decode(&meta); err != nil {
+		conn.Close()
 		return
 	}
 
-	// 2. Create Transfer object
-	transfer := &models.Transfer{
-		ID:        metadata.ID,
-		FileName:  metadata.FileName,
-		FileSize:  metadata.FileSize,
-		Direction: "receive",
-		PeerID:    metadata.PeerID,
-		PeerName:  metadata.PeerName,
-		Status:    "receiving",
-		StartTime: time.Now(),
-		Conn:      conn,
+	// Store pending transfer (conn stays open so we can write ACK later)
+	pt := &models.PendingTransfer{
+		ID:         meta.ID,
+		FileName:   meta.FileName,
+		FileSize:   meta.FileSize,
+		SenderID:   meta.SenderID,
+		SenderName: meta.SenderName,
+		Response:   make(chan bool, 1),
 	}
 
 	s.mu.Lock()
-	s.transfers[transfer.ID] = transfer
+	s.pending[meta.ID] = pt
 	s.mu.Unlock()
 
-	s.broadcast("transferUpdate", transfer)
+	// Notify UI of incoming request
+	s.broadcast("incoming_request", pt)
 
-	// 3. Receive file content
-	savePath := filepath.Join(s.config.DownloadDir, metadata.FileName)
+	// Wait for UI decision (timeout 2 minutes)
+	var accepted bool
+	select {
+	case accepted = <-pt.Response:
+	case <-time.After(2 * time.Minute):
+		accepted = false
+	}
+
+	// Send response back to sender
+	resp := wireResponse{Accept: accepted}
+	json.NewEncoder(conn).Encode(resp)
+
+	s.mu.Lock()
+	delete(s.pending, meta.ID)
+	s.mu.Unlock()
+
+	if !accepted {
+		conn.Close()
+		s.broadcast("transfer_rejected", map[string]string{"id": meta.ID, "fileName": meta.FileName})
+		return
+	}
+
+	// Accept → receive file
+	s.receiveFile(conn, meta)
+}
+
+func (s *Service) receiveFile(conn net.Conn, meta wireMetadata) {
+	defer conn.Close()
+
+	savePath := filepath.Join(s.config.DownloadDir, meta.FileName)
+	// Avoid overwriting: append a counter if file exists
+	if _, err := os.Stat(savePath); err == nil {
+		ext := filepath.Ext(meta.FileName)
+		base := meta.FileName[:len(meta.FileName)-len(ext)]
+		savePath = filepath.Join(s.config.DownloadDir, fmt.Sprintf("%s_%d%s", base, time.Now().UnixMilli(), ext))
+	}
+
 	file, err := os.Create(savePath)
 	if err != nil {
-		log.Println("Error creating file:", err)
+		log.Println("Create file error:", err)
 		return
 	}
 	defer file.Close()
 
-	// Buffer for reading chunks
-	buf := make([]byte, s.config.ChunkSize)
-	reader := conn // conn is an io.Reader
+	t := &models.Transfer{
+		ID:        meta.ID,
+		FileName:  meta.FileName,
+		FileSize:  meta.FileSize,
+		Direction: "receive",
+		PeerID:    meta.SenderID,
+		PeerName:  meta.SenderName,
+		Status:    "receiving",
+		StartTime: time.Now(),
+	}
+	s.mu.Lock()
+	s.transfers[t.ID] = t
+	s.mu.Unlock()
+	s.broadcast("transfer_update", t)
 
+	buf := make([]byte, s.config.ChunkSize)
 	lastUpdate := time.Now()
 
 	for {
-		n, err := reader.Read(buf)
+		n, err := conn.Read(buf)
 		if n > 0 {
 			file.Write(buf[:n])
-			transfer.Transferred += int64(n)
-			transfer.Progress = float64(transfer.Transferred) / float64(transfer.FileSize) * 100
-
-			// Update speed every second
+			t.Transferred += int64(n)
+			if t.FileSize > 0 {
+				t.Progress = float64(t.Transferred) / float64(t.FileSize) * 100
+			}
 			if time.Since(lastUpdate) > time.Second {
-				elapsed := time.Since(transfer.StartTime).Seconds()
+				elapsed := time.Since(t.StartTime).Seconds()
 				if elapsed > 0 {
-					transfer.Speed = float64(transfer.Transferred) / 1024 / 1024 / elapsed
+					t.Speed = float64(t.Transferred) / 1024 / 1024 / elapsed
 				}
-				s.broadcast("transferUpdate", transfer)
+				s.broadcast("transfer_update", t)
 				lastUpdate = time.Now()
 			}
 		}
@@ -133,38 +202,47 @@ func (s *Service) handleIncomingTransfer(conn net.Conn) {
 			break
 		}
 		if err != nil {
-			log.Println("Transfer error:", err)
-			transfer.Status = "failed"
-			s.broadcast("transferUpdate", transfer)
+			log.Println("Receive error:", err)
+			t.Status = "failed"
+			s.broadcast("transfer_update", t)
+			userEmail := s.getUsername()
+			s.store.AddHistory(userEmail, &models.TransferHistory{
+				ID:        t.ID,
+				FileName:  t.FileName,
+				FileSize:  t.FileSize,
+				Direction: "receive",
+				PeerName:  t.PeerName,
+				Status:    "failed",
+				Timestamp: time.Now(),
+			})
 			return
 		}
 	}
 
-	// 4. Verify (Optional, skipping heavy checksum for now or implementing if needed)
-	// Simplified for now: Send ACK?
+	t.Status = "completed"
+	t.Progress = 100
+	s.broadcast("transfer_update", t)
 
-	// 5. Complete
-	transfer.Status = "completed"
-	transfer.Progress = 100
-	s.broadcast("transferUpdate", transfer)
-
-	s.store.AddHistory(&models.TransferHistory{
-		ID:        transfer.ID,
-		FileName:  transfer.FileName,
-		FileSize:  transfer.FileSize,
+	userEmail := s.getUsername()
+	s.store.AddHistory(userEmail, &models.TransferHistory{
+		ID:        t.ID,
+		FileName:  t.FileName,
+		FileSize:  t.FileSize,
 		Direction: "receive",
-		PeerName:  transfer.PeerName,
-		Timestamp: time.Now(),
+		PeerName:  t.PeerName,
 		Status:    "completed",
+		Timestamp: time.Now(),
 	})
 
-	log.Printf("File received: %s", metadata.FileName)
+	log.Printf("Received file: %s from %s → %s", meta.FileName, meta.SenderName, savePath)
 }
 
-func (s *Service) SendFile(peerID, filePath string) error {
+// ----- Sender Side -----
+
+func (s *Service) SendFile(peerID, filePath, displayName string) error {
 	peer, ok := s.discovery.GetDevice(peerID)
 	if !ok {
-		return fmt.Errorf("peer not found")
+		return fmt.Errorf("peer not found: %s", peerID)
 	}
 
 	file, err := os.Open(filePath)
@@ -174,77 +252,97 @@ func (s *Service) SendFile(peerID, filePath string) error {
 	defer file.Close()
 
 	stat, _ := file.Stat()
-	fileName := filepath.Base(filePath)
-	transferID := fmt.Sprintf("mk-%d", time.Now().UnixNano())
+	fileName := displayName
+	if fileName == "" {
+		fileName = filepath.Base(filePath)
+	}
+	transferID := uuid.New().String()
+	senderName := s.getUsername()
 
-	// Connect to peer
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", peer.IP, peer.Port))
 	if err != nil {
-		return err
+		return fmt.Errorf("dial peer: %w", err)
 	}
-	defer conn.Close() // In a real app, keep open until confirmed?
+	defer conn.Close()
 
-	// Create Transfer Object
-	transfer := &models.Transfer{
+	// Send metadata
+	meta := wireMetadata{
+		ID:         transferID,
+		FileName:   fileName,
+		FileSize:   stat.Size(),
+		SenderID:   s.deviceID,
+		SenderName: senderName,
+	}
+	if err := json.NewEncoder(conn).Encode(meta); err != nil {
+		return fmt.Errorf("send metadata: %w", err)
+	}
+
+	t := &models.Transfer{
 		ID:        transferID,
 		FileName:  fileName,
 		FileSize:  stat.Size(),
 		Direction: "send",
 		PeerID:    peer.ID,
-		PeerName:  peer.Name,
-		Status:    "sending",
+		PeerName:  peer.Username,
+		Status:    "waiting_acceptance",
 		StartTime: time.Now(),
-		Conn:      conn,
 	}
-
 	s.mu.Lock()
-	s.transfers[transferID] = transfer
+	s.transfers[transferID] = t
 	s.mu.Unlock()
+	s.broadcast("transfer_update", t)
 
-	s.broadcast("transferUpdate", transfer)
-
-	// Send Metadata
-	metadata := map[string]interface{}{
-		"id":       transferID,
-		"fileName": fileName,
-		"fileSize": stat.Size(),
-		"peerId":   s.deviceID,
-		// Wait, I need my Device Name/ID to send to peer.
-		// I don't have access to my DeviceID here easily unless passed.
-		// I'll use config.DeviceName and pass ID in Service struct or Config?
-		// discovery service knows the ID.
-		"peerName": s.config.DeviceName,
+	// Wait for receiver's accept/reject response
+	conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+	var resp wireResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		t.Status = "failed"
+		s.broadcast("transfer_update", t)
+		return fmt.Errorf("reading response: %w", err)
 	}
-	// Note: peerId in metadata is Sender's ID.
-	// How do I get MY device ID?
-	// I'll add DeviceID to Service struct (it wasn't in NewService args but I need it).
-	// Let's assume I pass it in NewService or Config.
+	conn.SetReadDeadline(time.Time{}) // clear deadline
 
-	// Actually I'll use a placeholder for now or fix NewService.
-	// I will fix NewService to accept DeviceID.
+	if !resp.Accept {
+		t.Status = "rejected"
+		s.broadcast("transfer_update", t)
+		userEmail := s.getUsername()
+		s.store.AddHistory(userEmail, &models.TransferHistory{
+			ID:        t.ID,
+			FileName:  t.FileName,
+			FileSize:  t.FileSize,
+			Direction: "send",
+			PeerName:  t.PeerName,
+			Status:    "rejected",
+			Timestamp: time.Now(),
+		})
+		return fmt.Errorf("receiver rejected the transfer")
+	}
 
-	json.NewEncoder(conn).Encode(metadata)
+	// Accepted → stream the file
+	t.Status = "sending"
+	s.broadcast("transfer_update", t)
 
-	// Stream File
 	buf := make([]byte, s.config.ChunkSize)
 	lastUpdate := time.Now()
 
 	for {
 		n, err := file.Read(buf)
 		if n > 0 {
-			_, wErr := conn.Write(buf[:n])
-			if wErr != nil {
+			if _, wErr := conn.Write(buf[:n]); wErr != nil {
+				t.Status = "failed"
+				s.broadcast("transfer_update", t)
 				return wErr
 			}
-			transfer.Transferred += int64(n)
-			transfer.Progress = float64(transfer.Transferred) / float64(transfer.FileSize) * 100
-
+			t.Transferred += int64(n)
+			if t.FileSize > 0 {
+				t.Progress = float64(t.Transferred) / float64(t.FileSize) * 100
+			}
 			if time.Since(lastUpdate) > time.Second {
-				elapsed := time.Since(transfer.StartTime).Seconds()
+				elapsed := time.Since(t.StartTime).Seconds()
 				if elapsed > 0 {
-					transfer.Speed = float64(transfer.Transferred) / 1024 / 1024 / elapsed
+					t.Speed = float64(t.Transferred) / 1024 / 1024 / elapsed
 				}
-				s.broadcast("transferUpdate", transfer)
+				s.broadcast("transfer_update", t)
 				lastUpdate = time.Now()
 			}
 		}
@@ -252,25 +350,52 @@ func (s *Service) SendFile(peerID, filePath string) error {
 			break
 		}
 		if err != nil {
+			t.Status = "failed"
+			s.broadcast("transfer_update", t)
 			return err
 		}
 	}
 
-	transfer.Status = "completed"
-	transfer.Progress = 100
-	s.broadcast("transferUpdate", transfer)
+	t.Status = "completed"
+	t.Progress = 100
+	s.broadcast("transfer_update", t)
 
-	s.store.AddHistory(&models.TransferHistory{
-		ID:        transfer.ID,
-		FileName:  transfer.FileName,
-		FileSize:  transfer.FileSize,
+	userEmail := s.getUsername()
+	s.store.AddHistory(userEmail, &models.TransferHistory{
+		ID:        t.ID,
+		FileName:  t.FileName,
+		FileSize:  t.FileSize,
 		Direction: "send",
-		PeerName:  transfer.PeerName,
-		Timestamp: time.Now(),
+		PeerName:  t.PeerName,
 		Status:    "completed",
+		Timestamp: time.Now(),
 	})
 
-	log.Printf("File sent: %s", fileName)
+	log.Printf("Sent file %s to %s", fileName, peer.Username)
+	return nil
+}
+
+// AcceptTransfer signals the pending goroutine to accept and stream.
+func (s *Service) AcceptTransfer(id string) error {
+	s.mu.RLock()
+	pt, ok := s.pending[id]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("no pending transfer: %s", id)
+	}
+	pt.Response <- true
+	return nil
+}
+
+// RejectTransfer signals the pending goroutine to reject.
+func (s *Service) RejectTransfer(id string) error {
+	s.mu.RLock()
+	pt, ok := s.pending[id]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("no pending transfer: %s", id)
+	}
+	pt.Response <- false
 	return nil
 }
 
@@ -284,10 +409,12 @@ func (s *Service) GetTransfers() []*models.Transfer {
 	return list
 }
 
-func calculateChecksum(path string) string {
-	f, _ := os.Open(path)
-	defer f.Close()
-	h := md5.New()
-	io.Copy(h, f)
-	return hex.EncodeToString(h.Sum(nil))
+func (s *Service) GetPending() []*models.PendingTransfer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]*models.PendingTransfer, 0, len(s.pending))
+	for _, p := range s.pending {
+		list = append(list, p)
+	}
+	return list
 }

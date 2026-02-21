@@ -1,15 +1,17 @@
 package api
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -20,69 +22,69 @@ import (
 	"filetransfer/internal/transfer"
 )
 
-type Server struct {
-	config      config.Config
-	store       *storage.Store
-	discovery   *discovery.Service
-	transfer    *transfer.Service
-	wsClients   map[*websocket.Conn]bool
-	wsMu        sync.Mutex
-	mu          sync.RWMutex
-	currentUser *models.User
-	localIP     string
-	webContent  fs.FS
-}
-
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-func NewServer(cfg config.Config, store *storage.Store, disc *discovery.Service, ip string, webFS fs.FS) *Server {
+type Server struct {
+	config     config.Config
+	store      *storage.Store
+	disc       *discovery.Service
+	transfer   *transfer.Service
+	webContent embed.FS
+	localIP    string
+
+	wsClients map[*websocket.Conn]bool
+	wsMu      sync.Mutex
+
+	mu          sync.RWMutex
+	currentUser *models.User // logged-in user for this instance
+}
+
+func NewServer(
+	cfg config.Config,
+	store *storage.Store,
+	disc *discovery.Service,
+	ts *transfer.Service,
+	localIP string,
+	content embed.FS,
+) *Server {
 	return &Server{
 		config:     cfg,
 		store:      store,
-		discovery:  disc,
-		localIP:    ip,
-		webContent: webFS,
+		disc:       disc,
+		transfer:   ts,
+		localIP:    localIP,
+		webContent: content,
 		wsClients:  make(map[*websocket.Conn]bool),
 	}
 }
 
-func (s *Server) SetTransferService(ts *transfer.Service) {
-	s.transfer = ts
-}
+// SetDiscovery wires the discovery service (called after NewServer to resolve circular dep).
+func (s *Server) SetDiscovery(d *discovery.Service) { s.disc = d }
 
-func (s *Server) SetDiscoveryService(ds *discovery.Service) {
-	s.discovery = ds
-}
+// SetTransfer wires the transfer service.
+func (s *Server) SetTransfer(t *transfer.Service) { s.transfer = t }
 
-func (s *Server) GetCurrentUser() *models.User {
+// GetUsername returns the email of the currently logged-in user (used by discovery).
+func (s *Server) GetUsername() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.currentUser
-}
-
-func (s *Server) GetUsername() string {
-	user := s.GetCurrentUser()
-	if user != nil {
-		return user.Username
+	if s.currentUser != nil {
+		return s.currentUser.Email
 	}
 	return ""
 }
 
+// Broadcast sends a JSON message to all connected WebSocket clients.
 func (s *Server) Broadcast(msgType string, payload interface{}) {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
-
-	msg := map[string]interface{}{
-		"type":    msgType,
-		"payload": payload,
-	}
-
-	for client := range s.wsClients {
-		if err := client.WriteJSON(msg); err != nil {
-			client.Close()
-			delete(s.wsClients, client)
+	msg := map[string]interface{}{"type": msgType, "payload": payload}
+	for conn := range s.wsClients {
+		if err := conn.WriteJSON(msg); err != nil {
+			conn.Close()
+			delete(s.wsClients, conn)
 		}
 	}
 }
@@ -90,190 +92,335 @@ func (s *Server) Broadcast(msgType string, payload interface{}) {
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 
-	// API Routes
-	mux.HandleFunc("/", s.handleIndex)
-	mux.HandleFunc("/ws", s.handleWebSocket)
-	mux.HandleFunc("/api/devices", s.handleDevices)
-	mux.HandleFunc("/api/transfers", s.handleTransfers)
-	mux.HandleFunc("/api/history", s.handleHistory)
-	mux.HandleFunc("/api/upload", s.handleUpload)
-	mux.HandleFunc("/api/info", s.handleInfo)
-	mux.HandleFunc("/api/login", s.handleLogin)
-	mux.HandleFunc("/api/register", s.handleRegister)
-	mux.HandleFunc("/api/logout", s.handleLogout)
+	// Auth (no middleware)
+	mux.HandleFunc("/api/auth/register", s.handleRegister)
+	mux.HandleFunc("/api/auth/login", s.handleLogin)
+	mux.HandleFunc("/api/auth/logout", s.requireAuth(s.handleLogout))
 
-	// Static Files
-	staticFS, _ := fs.Sub(s.webContent, "web/static")
+	// App (auth required)
+	mux.HandleFunc("/api/devices", s.requireAuth(s.handleDevices))
+	mux.HandleFunc("/api/transfer/send", s.requireAuth(s.handleSend))
+	mux.HandleFunc("/api/transfer/accept", s.requireAuth(s.handleAccept))
+	mux.HandleFunc("/api/transfer/reject", s.requireAuth(s.handleReject))
+	mux.HandleFunc("/api/transfers/active", s.requireAuth(s.handleActiveTransfers))
+	mux.HandleFunc("/api/history", s.requireAuth(s.handleHistory))
+	mux.HandleFunc("/api/files", s.requireAuth(s.handleFiles))
+	mux.HandleFunc("/api/me", s.requireAuth(s.handleMe))
+	mux.HandleFunc("/ws", s.handleWS)
+
+	// Static
+	staticFS, _ := fs.Sub(s.webContent, "static")
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
 
-	// Downloads
-	mux.Handle("/dl/", http.StripPrefix("/dl/", http.FileServer(http.Dir(s.config.DownloadDir))))
+	// Downloads (auth required)
+	mux.HandleFunc("/dl/", s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		http.StripPrefix("/dl/", http.FileServer(http.Dir(s.config.DownloadDir))).ServeHTTP(w, r)
+	}))
 
-	return http.ListenAndServe(fmt.Sprintf(":%d", s.config.ServerPort), mux)
+	// Catch-all: serve SPA or redirect to auth
+	mux.HandleFunc("/", s.handleIndex)
+
+	addr := fmt.Sprintf(":%d", s.config.ServerPort)
+	log.Printf("Web UI listening on http://localhost%s", addr)
+	return http.ListenAndServe(addr, mux)
 }
+
+// ---- Middleware ----
+
+func (s *Server) sessionUser(r *http.Request) *models.User {
+	cookie, err := r.Cookie(s.cookieName())
+	if err != nil {
+		return nil
+	}
+	email, ok := s.store.GetSession(cookie.Value)
+	if !ok {
+		log.Printf("[AUTH] Session not found for token: %s (maybe server restarted?)", cookie.Value)
+		return nil
+	}
+	u, err := s.store.GetUserByEmail(email)
+	if err != nil {
+		log.Printf("[AUTH] User %s not found in DB", email)
+		return nil
+	}
+	s.mu.Lock()
+	s.currentUser = u
+	s.mu.Unlock()
+	return u
+}
+
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u := s.sessionUser(r)
+		if u == nil {
+			log.Printf("[AUTH] Unauthorized request: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// ---- Page Handler ----
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	user := s.currentUser
-	s.mu.RUnlock()
-
-	tmplName := "web/templates/index.html"
+	user := s.sessionUser(r)
 	if user == nil {
-		tmplName = "web/templates/login.html"
-	}
-
-	tmpl, err := template.ParseFS(s.webContent, tmplName)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
+		// Serve auth page
+		data, err := s.webContent.ReadFile("templates/auth.html")
+		if err != nil {
+			http.Error(w, "Template not found", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.Write(data)
 		return
 	}
-
-	data := map[string]interface{}{
-		"DeviceName": s.config.DeviceName,
-		"LocalIP":    s.localIP,
-		"ServerPort": s.config.ServerPort,
+	data, err := s.webContent.ReadFile("templates/index.html")
+	if err != nil {
+		http.Error(w, "Template not found", 500)
+		return
 	}
-	if user != nil {
-		data["UserName"] = user.Username
-	}
-	tmpl.Execute(w, data)
+	w.Header().Set("Content-Type", "text/html")
+	w.Write(data)
 }
 
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+// ---- Auth Handlers ----
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", 405)
 		return
 	}
-
-	var creds struct {
-		Username string `json:"username"`
+	var body struct {
+		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		http.Error(w, "Invalid request", 400)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "Invalid request", 400)
+		return
+	}
+	if body.Email == "" || body.Password == "" {
+		jsonError(w, "Email and password required", 400)
+		return
+	}
+	if err := s.store.RegisterUser(body.Email, body.Password); err != nil {
+		jsonError(w, "Email already registered", 400)
 		return
 	}
 
-	user, success := s.store.LoginUser(creds.Username, creds.Password)
-	if !success {
-		http.Error(w, "Invalid credentials", 401)
+	token := s.store.CreateSession(body.Email)
+	http.SetCookie(w, s.sessionCookie(token))
+
+	u, _ := s.store.GetUserByEmail(body.Email)
+	s.mu.Lock()
+	s.currentUser = u
+	s.mu.Unlock()
+
+	log.Printf("[AUTH] New registration & login: %s", body.Email)
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "email": body.Email})
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
 		return
 	}
+	var body struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "Invalid request", 400)
+		return
+	}
+	user, err := s.store.AuthenticateUser(body.Email, body.Password)
+	if err != nil {
+		jsonError(w, err.Error(), 401)
+		return
+	}
+	token := s.store.CreateSession(user.Email)
+	http.SetCookie(w, s.sessionCookie(token))
 
 	s.mu.Lock()
 	s.currentUser = user
 	s.mu.Unlock()
 
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", 405)
-		return
-	}
-
-	var creds struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		http.Error(w, "Invalid request", 400)
-		return
-	}
-
-	if err := s.store.RegisterUser(creds.Username, creds.Password); err != nil {
-		http.Error(w, "User already exists or error", 400)
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	log.Printf("[AUTH] Logged in: %s", user.Email)
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "email": user.Email})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	s.currentUser = nil
-	s.mu.Unlock()
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	cookie, err := r.Cookie(s.cookieName())
+	if err == nil {
+		s.store.DeleteSession(cookie.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:    s.cookieName(),
+		Value:   "",
+		Expires: time.Unix(0, 0),
+		Path:    "/",
+	})
+	jsonOK(w, "logged out")
 }
 
-func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
-	devices := s.discovery.GetDevices()
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	user := s.sessionUser(r)
 	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"email":      user.Email,
+		"deviceName": s.config.DeviceName,
+		"localIP":    s.localIP,
+	})
+}
+
+// ---- App Handlers ----
+
+func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
+	devices := s.disc.GetDevices()
+	w.Header().Set("Content-Type", "application/json")
+	if devices == nil {
+		devices = []*models.Device{}
+	}
 	json.NewEncoder(w).Encode(devices)
 }
 
-func (s *Server) handleTransfers(w http.ResponseWriter, r *http.Request) {
-	transfers := s.transfer.GetTransfers()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(transfers)
-}
-
-func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	history := s.store.GetHistory()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(history)
-}
-
-func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	user := s.currentUser
-	s.mu.RUnlock()
-
-	info := map[string]interface{}{
-		"deviceName": s.config.DeviceName,
-		"localIP":    s.localIP,
-	}
-	if user != nil {
-		info["username"] = user.Username
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
-}
-
-func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	if err := r.ParseMultipartForm(512 << 20); err != nil {
+		log.Println("Form error:", err)
+		jsonError(w, "File upload error", 400)
 		return
 	}
 
 	deviceID := r.FormValue("deviceId")
 	if deviceID == "" {
-		http.Error(w, "Device ID required", 400)
+		jsonError(w, "deviceId required", 400)
 		return
 	}
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "File required", 400)
+		jsonError(w, "file required", 400)
 		return
 	}
 	defer file.Close()
 
-	// Save temporarily
-	tempPath := filepath.Join(os.TempDir(), header.Filename)
-	tempFile, err := os.Create(tempPath)
+	// Use a safer temp filename
+	safeName := filepath.Base(header.Filename)
+	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("upload_%d_%s", time.Now().UnixNano(), safeName))
+
+	tmpFile, err := os.Create(tmpPath)
 	if err != nil {
-		http.Error(w, "Failed to create temp file", 500)
+		log.Println("Temp file create error:", err)
+		jsonError(w, "could not create temp file", 500)
 		return
 	}
 
-	io.Copy(tempFile, file)
-	tempFile.Close()
+	if _, err := io.Copy(tmpFile, file); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		jsonError(w, "could not write temp file", 500)
+		return
+	}
+	tmpFile.Close()
 
-	// Send file in background
+	log.Printf("Initiating transfer to %s: %s (%d bytes)", deviceID, safeName, header.Size)
+
 	go func() {
-		defer os.Remove(tempPath)
-		if err := s.transfer.SendFile(deviceID, tempPath); err != nil {
-			fmt.Printf("Send file error: %v\n", err)
+		defer os.Remove(tmpPath)
+		if err := s.transfer.SendFile(deviceID, tmpPath, safeName); err != nil {
+			log.Println("Send error:", err)
 		}
 	}()
 
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	jsonOK(w, "transfer initiated")
 }
 
-func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAccept(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	var body struct {
+		TransferID string `json:"transferId"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if err := s.transfer.AcceptTransfer(body.TransferID); err != nil {
+		jsonError(w, err.Error(), 404)
+		return
+	}
+	jsonOK(w, "accepted")
+}
+
+func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	var body struct {
+		TransferID string `json:"transferId"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if err := s.transfer.RejectTransfer(body.TransferID); err != nil {
+		jsonError(w, err.Error(), 404)
+		return
+	}
+	jsonOK(w, "rejected")
+}
+
+func (s *Server) handleActiveTransfers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	transfers := s.transfer.GetTransfers()
+	if transfers == nil {
+		transfers = []*models.Transfer{}
+	}
+	json.NewEncoder(w).Encode(transfers)
+}
+
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	u := s.sessionUser(r)
+	history, err := s.store.GetHistory(u.Email)
+	if err != nil {
+		jsonError(w, "DB error", 500)
+		return
+	}
+	if history == nil {
+		history = []*models.TransferHistory{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(history)
+}
+
+func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
+	entries, err := os.ReadDir(s.config.DownloadDir)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
+	var files []map[string]interface{}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, _ := e.Info()
+		files = append(files, map[string]interface{}{
+			"name":      e.Name(),
+			"size":      info.Size(),
+			"timestamp": info.ModTime(),
+		})
+	}
+	if files == nil {
+		files = []map[string]interface{}{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(files)
+}
+
+func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -282,5 +429,45 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.wsClients[conn] = true
 	s.wsMu.Unlock()
 
-	// Send initial data if needed, or wait for broadcast
+	// Keep alive — read pump to detect disconnects
+	go func() {
+		defer func() {
+			s.wsMu.Lock()
+			delete(s.wsClients, conn)
+			s.wsMu.Unlock()
+			conn.Close()
+		}()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				break
+			}
+		}
+	}()
+}
+
+// ---- Helpers ----
+
+func (s *Server) cookieName() string {
+	return fmt.Sprintf("ft_session_%d", s.config.ServerPort)
+}
+
+func (s *Server) sessionCookie(token string) *http.Cookie {
+	return &http.Cookie{
+		Name:     s.cookieName(),
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Expires:  time.Now().Add(24 * time.Hour),
+	}
+}
+
+func jsonOK(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": msg})
+}
+
+func jsonError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
