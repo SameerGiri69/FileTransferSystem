@@ -1,16 +1,26 @@
 services:
   app:
     build: .
-    ports:
-      - "8080:8080"
-      - "9000:9000"
-      - "9001:9001/udp"
+    network_mode: host
     environment:
-      - DATABASE_URL=host=db port=5432 user=sameer password=Sameer@123 dbname=filetransfer sslmode=disable
+      - DATABASE_URL=host=127.0.0.1 port=5433 user=sameer password=Sameer@123 dbname=filetransfer sslmode=disable
     volumes:
-      - ./downloads_docker:/app/downloads
+      - ./downloads_docker_1:/app/downloads
     depends_on:
       db:
+        condition: service_healthy
+    restart: always
+
+  app2:
+    build: .
+    network_mode: host
+    command: [ "./filetransfer", "-web", "8081", "-transfer", "9002", "-name", "Peer-2" ]
+    environment:
+      - DATABASE_URL=host=127.0.0.1 port=5434 user=sameer password=Sameer@123 dbname=filetransfer sslmode=disable
+    volumes:
+      - ./downloads_docker_2:/app/downloads
+    depends_on:
+      db2:
         condition: service_healthy
     restart: always
 
@@ -23,7 +33,24 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data_1:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U sameer -d filetransfer" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  db2:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=sameer
+      - POSTGRES_PASSWORD=Sameer@123
+      - POSTGRES_DB=filetransfer
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data_2:/var/lib/postgresql/data
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U sameer -d filetransfer" ]
       interval: 5s
@@ -32,4 +59,5 @@ services:
     restart: always
 
 volumes:
-  postgres_data:
+  postgres_data_1:
+  postgres_data_2:
