@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -289,54 +288,54 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", 405)
 		return
 	}
-	if err := r.ParseMultipartForm(512 << 20); err != nil {
-		log.Println("Form error:", err)
-		jsonError(w, "File upload error", 400)
-		return
-	}
 
-	deviceID := r.FormValue("deviceId")
-	if deviceID == "" {
-		jsonError(w, "deviceId required", 400)
-		return
-	}
-
-	file, header, err := r.FormFile("file")
+	mr, err := r.MultipartReader()
 	if err != nil {
-		jsonError(w, "file required", 400)
-		return
-	}
-	defer file.Close()
-
-	// Use a safer temp filename
-	safeName := filepath.Base(header.Filename)
-	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("upload_%d_%s", time.Now().UnixNano(), safeName))
-
-	tmpFile, err := os.Create(tmpPath)
-	if err != nil {
-		log.Println("Temp file create error:", err)
-		jsonError(w, "could not create temp file", 500)
+		jsonError(w, "Invalid multipart request", 400)
 		return
 	}
 
-	if _, err := io.Copy(tmpFile, file); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
-		jsonError(w, "could not write temp file", 500)
-		return
-	}
-	tmpFile.Close()
+	var deviceID string
+	var fileSize int64
+	var fileName string
 
-	log.Printf("Initiating transfer to %s: %s (%d bytes)", deviceID, safeName, header.Size)
-
-	go func() {
-		defer os.Remove(tmpPath)
-		if err := s.transfer.SendFile(deviceID, tmpPath, safeName); err != nil {
-			log.Println("Send error:", err)
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
 		}
-	}()
+		if err != nil {
+			jsonError(w, "Error reading part", 400)
+			return
+		}
 
-	jsonOK(w, "transfer initiated")
+		switch part.FormName() {
+		case "deviceId":
+			data, _ := io.ReadAll(part)
+			deviceID = string(data)
+		case "fileSize":
+			data, _ := io.ReadAll(part)
+			fmt.Sscanf(string(data), "%d", &fileSize)
+		case "file":
+			fileName = part.FileName()
+			if deviceID == "" || fileSize == 0 {
+				jsonError(w, "deviceId and fileSize must precede the file part", 400)
+				return
+			}
+			// Stream the file part directly to the transfer service
+			log.Printf("Initiating streaming transfer to %s: %s (%d bytes)", deviceID, fileName, fileSize)
+			if err := s.transfer.SendStream(deviceID, part, fileName, fileSize); err != nil {
+				log.Println("Streaming send error:", err)
+				jsonError(w, fmt.Sprintf("Transfer failed: %v", err), 500)
+				return
+			}
+
+			jsonOK(w, "transfer completed")
+			return
+		}
+	}
+
+	jsonError(w, "file part not found", 400)
 }
 
 func (s *Server) handleAccept(w http.ResponseWriter, r *http.Request) {

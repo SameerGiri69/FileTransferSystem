@@ -41,6 +41,7 @@ type Transfer struct {
 	PeerID      string    `json:"peerId"`
 	PeerName    string    `json:"peerName"`
 	StartTime   time.Time `json:"startTime"`
+	EndTime     int64     `json:"endTime"` // Unix timestamp in ms
 }
 
 type TransferHistory struct {

@@ -170,6 +170,7 @@ const App = (() => {
 
         const fd = new FormData();
         fd.append('deviceId', selectedDeviceId);
+        fd.append('fileSize', selectedFile.size.toString());
         fd.append('file', selectedFile);
 
         try {
@@ -200,6 +201,9 @@ const App = (() => {
     // Active Transfers
     // ----------------------------------------------------------------
     function updateActiveTransfer(t) {
+        if (['completed', 'failed', 'rejected'].includes(t.status)) {
+            t.endTime = Date.now();
+        }
         activeTransfers[t.id] = t;
         renderActiveTransfers();
     }
@@ -212,7 +216,13 @@ const App = (() => {
     function renderActiveTransfers() {
         const list = document.getElementById('active-list');
         const section = document.getElementById('active-section');
-        const items = Object.values(activeTransfers).filter(t => !['completed', 'failed', 'rejected'].includes(t.status));
+        const items = Object.values(activeTransfers).filter(t => {
+            // Keep if not completed/failed/rejected
+            if (!['completed', 'failed', 'rejected'].includes(t.status)) return true;
+            // Or if it was completed/failed/rejected very recently (within 5 seconds)
+            const elapsed = (Date.now() - (t.endTime || 0)) / 1000;
+            return elapsed < 5;
+        });
 
         section.style.display = items.length ? 'block' : 'none';
         list.innerHTML = '';
@@ -231,7 +241,10 @@ const App = (() => {
         </div>
         <div class="transfer-progress-wrap">
           <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
-          <div class="progress-text">${pct}%</div>
+          <div class="progress-stats">
+            <div class="progress-mb">${fmtSize(t.transferred || 0)} / ${fmtSize(t.fileSize || 0)}</div>
+            <div class="progress-text">${pct}%</div>
+          </div>
         </div>`;
             list.appendChild(row);
         });

@@ -96,8 +96,9 @@ func (s *Service) handleIncoming(conn net.Conn) {
 	}()
 
 	reader := bufio.NewReader(conn)
+	decoder := json.NewDecoder(reader)
 	var meta wireMetadata
-	if err := json.NewDecoder(reader).Decode(&meta); err != nil {
+	if err := decoder.Decode(&meta); err != nil {
 		conn.Close()
 		return
 	}
@@ -113,6 +114,11 @@ func (s *Service) handleIncoming(conn net.Conn) {
 	}
 
 	s.mu.Lock()
+	if _, ok := s.pending[meta.ID]; ok {
+		s.mu.Unlock()
+		conn.Close()
+		return
+	}
 	s.pending[meta.ID] = pt
 	s.mu.Unlock()
 
@@ -142,11 +148,28 @@ func (s *Service) handleIncoming(conn net.Conn) {
 	}
 
 	// Accept → receive file
-	s.receiveFile(conn, meta)
+	// Use MultiReader to include any data that json.NewDecoder might have already read into its internal buffer
+	combinedReader := io.MultiReader(decoder.Buffered(), reader)
+	s.receiveFile(conn, combinedReader, meta)
 }
 
-func (s *Service) receiveFile(conn net.Conn, meta wireMetadata) {
+func (s *Service) receiveFile(conn net.Conn, reader io.Reader, meta wireMetadata) {
 	defer conn.Close()
+
+	// Skip any leading whitespace (like the newline added by json.NewEncoder.Encode)
+	// by using a bufio.Reader to peek and skip.
+	skipReader := bufio.NewReader(reader)
+	for {
+		b, err := skipReader.Peek(1)
+		if err != nil {
+			break
+		}
+		if b[0] == '\n' || b[0] == '\r' || b[0] == ' ' {
+			skipReader.ReadByte()
+		} else {
+			break
+		}
+	}
 
 	savePath := filepath.Join(s.config.DownloadDir, meta.FileName)
 	// Avoid overwriting: append a counter if file exists
@@ -182,7 +205,7 @@ func (s *Service) receiveFile(conn net.Conn, meta wireMetadata) {
 	lastUpdate := time.Now()
 
 	for {
-		n, err := conn.Read(buf)
+		n, err := skipReader.Read(buf)
 		if n > 0 {
 			file.Write(buf[:n])
 			t.Transferred += int64(n)
@@ -205,16 +228,18 @@ func (s *Service) receiveFile(conn net.Conn, meta wireMetadata) {
 			log.Println("Receive error:", err)
 			t.Status = "failed"
 			s.broadcast("transfer_update", t)
-			userEmail := s.getUsername()
-			s.store.AddHistory(userEmail, &models.TransferHistory{
-				ID:        t.ID,
-				FileName:  t.FileName,
-				FileSize:  t.FileSize,
-				Direction: "receive",
-				PeerName:  t.PeerName,
-				Status:    "failed",
-				Timestamp: time.Now(),
-			})
+			if s.store != nil {
+				userEmail := s.getUsername()
+				s.store.AddHistory(userEmail, &models.TransferHistory{
+					ID:        t.ID,
+					FileName:  t.FileName,
+					FileSize:  t.FileSize,
+					Direction: "receive",
+					PeerName:  t.PeerName,
+					Status:    "failed",
+					Timestamp: time.Now(),
+				})
+			}
 			return
 		}
 	}
@@ -223,39 +248,31 @@ func (s *Service) receiveFile(conn net.Conn, meta wireMetadata) {
 	t.Progress = 100
 	s.broadcast("transfer_update", t)
 
-	userEmail := s.getUsername()
-	s.store.AddHistory(userEmail, &models.TransferHistory{
-		ID:        t.ID,
-		FileName:  t.FileName,
-		FileSize:  t.FileSize,
-		Direction: "receive",
-		PeerName:  t.PeerName,
-		Status:    "completed",
-		Timestamp: time.Now(),
-	})
+	if s.store != nil {
+		userEmail := s.getUsername()
+		s.store.AddHistory(userEmail, &models.TransferHistory{
+			ID:        t.ID,
+			FileName:  t.FileName,
+			FileSize:  t.FileSize,
+			Direction: "receive",
+			PeerName:  t.PeerName,
+			Status:    "completed",
+			Timestamp: time.Now(),
+		})
+	}
 
 	log.Printf("Received file: %s from %s → %s", meta.FileName, meta.SenderName, savePath)
 }
 
 // ----- Sender Side -----
 
-func (s *Service) SendFile(peerID, filePath, displayName string) error {
+// SendStream connects to a peer and streams data from a reader.
+func (s *Service) SendStream(peerID string, dataReader io.Reader, fileName string, fileSize int64) error {
 	peer, ok := s.discovery.GetDevice(peerID)
 	if !ok {
 		return fmt.Errorf("peer not found: %s", peerID)
 	}
 
-	file, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	stat, _ := file.Stat()
-	fileName := displayName
-	if fileName == "" {
-		fileName = filepath.Base(filePath)
-	}
 	transferID := uuid.New().String()
 	senderName := s.getUsername()
 
@@ -269,7 +286,7 @@ func (s *Service) SendFile(peerID, filePath, displayName string) error {
 	meta := wireMetadata{
 		ID:         transferID,
 		FileName:   fileName,
-		FileSize:   stat.Size(),
+		FileSize:   fileSize,
 		SenderID:   s.deviceID,
 		SenderName: senderName,
 	}
@@ -280,7 +297,7 @@ func (s *Service) SendFile(peerID, filePath, displayName string) error {
 	t := &models.Transfer{
 		ID:        transferID,
 		FileName:  fileName,
-		FileSize:  stat.Size(),
+		FileSize:  fileSize,
 		Direction: "send",
 		PeerID:    peer.ID,
 		PeerName:  peer.Username,
@@ -297,6 +314,7 @@ func (s *Service) SendFile(peerID, filePath, displayName string) error {
 	var resp wireResponse
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		t.Status = "failed"
+		t.EndTime = time.Now().UnixMilli()
 		s.broadcast("transfer_update", t)
 		return fmt.Errorf("reading response: %w", err)
 	}
@@ -304,21 +322,24 @@ func (s *Service) SendFile(peerID, filePath, displayName string) error {
 
 	if !resp.Accept {
 		t.Status = "rejected"
+		t.EndTime = time.Now().UnixMilli()
 		s.broadcast("transfer_update", t)
-		userEmail := s.getUsername()
-		s.store.AddHistory(userEmail, &models.TransferHistory{
-			ID:        t.ID,
-			FileName:  t.FileName,
-			FileSize:  t.FileSize,
-			Direction: "send",
-			PeerName:  t.PeerName,
-			Status:    "rejected",
-			Timestamp: time.Now(),
-		})
+		if s.store != nil {
+			userEmail := s.getUsername()
+			s.store.AddHistory(userEmail, &models.TransferHistory{
+				ID:        t.ID,
+				FileName:  t.FileName,
+				FileSize:  t.FileSize,
+				Direction: "send",
+				PeerName:  t.PeerName,
+				Status:    "rejected",
+				Timestamp: time.Now(),
+			})
+		}
 		return fmt.Errorf("receiver rejected the transfer")
 	}
 
-	// Accepted → stream the file
+	// Accepted → stream the data
 	t.Status = "sending"
 	s.broadcast("transfer_update", t)
 
@@ -326,10 +347,11 @@ func (s *Service) SendFile(peerID, filePath, displayName string) error {
 	lastUpdate := time.Now()
 
 	for {
-		n, err := file.Read(buf)
+		n, err := dataReader.Read(buf)
 		if n > 0 {
 			if _, wErr := conn.Write(buf[:n]); wErr != nil {
 				t.Status = "failed"
+				t.EndTime = time.Now().UnixMilli()
 				s.broadcast("transfer_update", t)
 				return wErr
 			}
@@ -351,6 +373,7 @@ func (s *Service) SendFile(peerID, filePath, displayName string) error {
 		}
 		if err != nil {
 			t.Status = "failed"
+			t.EndTime = time.Now().UnixMilli()
 			s.broadcast("transfer_update", t)
 			return err
 		}
@@ -358,20 +381,23 @@ func (s *Service) SendFile(peerID, filePath, displayName string) error {
 
 	t.Status = "completed"
 	t.Progress = 100
+	t.EndTime = time.Now().UnixMilli()
 	s.broadcast("transfer_update", t)
 
-	userEmail := s.getUsername()
-	s.store.AddHistory(userEmail, &models.TransferHistory{
-		ID:        t.ID,
-		FileName:  t.FileName,
-		FileSize:  t.FileSize,
-		Direction: "send",
-		PeerName:  t.PeerName,
-		Status:    "completed",
-		Timestamp: time.Now(),
-	})
+	if s.store != nil {
+		userEmail := s.getUsername()
+		s.store.AddHistory(userEmail, &models.TransferHistory{
+			ID:        t.ID,
+			FileName:  t.FileName,
+			FileSize:  t.FileSize,
+			Direction: "send",
+			PeerName:  t.PeerName,
+			Status:    "completed",
+			Timestamp: time.Now(),
+		})
+	}
 
-	log.Printf("Sent file %s to %s", fileName, peer.Username)
+	log.Printf("Sent data %s to %s", fileName, peer.Username)
 	return nil
 }
 
